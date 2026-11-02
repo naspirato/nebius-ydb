@@ -667,27 +667,69 @@
         : (hasTotal ? Math.max(0, Number(hs.total_duration_sec)) : 0);
       let buildSec = hasBuild ? Math.max(0, Number(hs.build_duration_sec)) : 0;
       let totalSec = hasTotal ? Math.max(0, Number(hs.total_duration_sec)) : 0;
-      const buildSpan = activitySpanSec(['build', 'archive', 'cache', 'link']);
+      const buildSpan = activitySpanSec(['build', 'archive', 'link']);
       const testSpan = activitySpanSec(['test_tm', 'test_report']);
+      // Honest independent spans: keep overlap, but do not let post-test-only
+      // sparse AR/LD points stretch the build wall (cache excluded entirely).
       if (!hasBuild && buildSpan) {
-        const testStart = testSpan ? testSpan.start : null;
-        if (testStart != null && testStart > buildSpan.start) {
-          buildSec = Math.max(0, testStart - buildSpan.start);
-        } else {
-          buildSec = Math.max(0, buildSpan.end - buildSpan.start);
+        let buildEnd = buildSpan.end;
+        if (testSpan && buildSpan.start < testSpan.start && buildEnd > testSpan.start) {
+          const activity = data.ya_activity || {};
+          let lastBeforeOrOverlap = buildSpan.start;
+          ['build', 'archive', 'link'].forEach((kind) => {
+            const series = activity[kind] || {};
+            const xs = Array.isArray(series.xs) ? series.xs : [];
+            const ys = Array.isArray(series.ys) ? series.ys : [];
+            let active = false;
+            let runStart = null;
+            for (let i = 0; i < xs.length; i++) {
+              const x = Number(xs[i]);
+              const y = Number(ys[i]);
+              if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+              if (y > 0) {
+                if (!active) { active = true; runStart = x; }
+                if (runStart != null && runStart < testSpan.start && x > lastBeforeOrOverlap) {
+                  lastBeforeOrOverlap = x;
+                }
+              } else if (active) {
+                active = false;
+                runStart = null;
+              }
+            }
+          });
+          buildEnd = Math.max(buildSpan.start, lastBeforeOrOverlap);
         }
+        buildSec = Math.max(0, buildEnd - buildSpan.start);
       }
       if (!hasTest && testSpan) {
-        testSec = Math.max(0, testSpan.end - testSpan.start);
+        let testStart = testSpan.start;
+        let testEnd = testSpan.end;
+        // Match Python: if Test workers (TM) start later than report-backed
+        // activity, clamp — early report points sit left of the chart range.
+        const tmSpan = activitySpanSec(['test_tm']);
+        if (tmSpan && tmSpan.start > testStart) {
+          testStart = tmSpan.start;
+          if (tmSpan.end > testEnd) testEnd = tmSpan.end;
+        }
+        testSec = Math.max(0, testEnd - testStart);
       }
       const starts = [];
       const ends = [];
-      if (buildSpan) { starts.push(buildSpan.start); ends.push(buildSpan.end); }
-      if (testSpan) { starts.push(testSpan.start); ends.push(testSpan.end); }
+      if (buildSpan) { starts.push(buildSpan.start); ends.push(buildSpan.start + buildSec); }
+      if (testSec > 0) {
+        const tmSpan = activitySpanSec(['test_tm']);
+        const t0 = (tmSpan && testSpan && tmSpan.start > testSpan.start) ? tmSpan.start : (testSpan ? testSpan.start : null);
+        const t1 = t0 != null ? t0 + testSec : null;
+        if (t0 != null) starts.push(t0);
+        if (t1 != null) ends.push(t1);
+      } else if (testSpan) {
+        starts.push(testSpan.start); ends.push(testSpan.end);
+      }
       if (starts.length && ends.length) {
         totalSec = Math.max(0, Math.max.apply(null, ends) - Math.min.apply(null, starts));
       } else if (!totalSec) {
-        totalSec = Math.max(buildSec, 0) + Math.max(testSec, 0);
+        // Last resort when spans are missing: do not double-count overlap.
+        totalSec = Math.max(buildSec, testSec, 0);
       }
       return { totalSec, buildSec, testSec };
     }
@@ -741,14 +783,14 @@
           + 'from ya activity.">build = whole job</span>')
         : '';
       const buildTip = suiteFiltered
-        ? 'Whole-job build/archive/cache/link activity until the first filtered-suite test start'
-        : 'From the first build/archive/cache/link activity to the first test start';
+        ? 'Whole-job build/archive/link wall (cache excluded); overlap past test start counts, post-test-only spikes do not'
+        : 'Build/archive/link wall (cache excluded); overlap past test start counts, post-test-only spikes do not';
       const testTip = suiteFiltered
-        ? 'Filtered suites only: first matching test start → last matching test end'
-        : 'From the first test start to the last test end';
+        ? 'Filtered suites only: first matching test start → last matching test end (TM clamp if report starts early)'
+        : 'First → last test wall (start clamped to Test workers / TM when report starts before the chart)';
       const totalTip = suiteFiltered
-        ? 'Earliest of whole-job build start / filtered test start → latest end'
-        : 'From the first build/archive/cache/link activity to the last test end';
+        ? 'Earliest of whole-job build / filtered test start → latest end (overlap not summed)'
+        : 'Earliest of build/test start → latest of build/test end (overlap not summed)';
       const runLine =
         '<div class="headline-run">' +
           '<div class="headline-run-row">' +
@@ -816,29 +858,36 @@
         ['Active chunks', 'count', hs.active_chunks],
         ['Tests in parallel', 'count', hs.tests],
       ]);
-      const cpuHost = hs.cpu_host;
-      const ramHost = hs.ram_host;
-      const diskRead = hs.disk_read_host;
-      const diskWrite = hs.disk_write_host;
-      let hostBlock = '';
-      if (cpuHost || ramHost || diskRead || diskWrite) {
+      function hostProcBlock(title, cpuHost, ramHost, diskRead, diskWrite) {
+        if (!(cpuHost || ramHost || diskRead || diskWrite)) return '';
         const samples = Math.round(Number((cpuHost || ramHost || diskRead || {}).samples || 0));
         const sampleNote = samples ? ' · ' + String(samples) + ' samples' : '';
-        hostBlock =
-          '<div class="headline-block"><h4>Host · /proc' + sampleNote + '</h4>' +
+        return (
+          '<div class="headline-block"><h4>' + title + sampleNote + '</h4>' +
           statTable([
             ['CPU, cores', 'cpu', cpuHost, hostCapacity('cpu')],
             ['RAM, GB', 'ram', ramHost, hostCapacity('ram')],
             ['Disk read, MB/s', 'disk', diskRead, null],
             ['Disk write, MB/s', 'disk', diskWrite, null],
           ], true) +
-          '</div>';
+          '</div>'
+        );
       }
+      // Full job /proc (build+tests+tail) vs tests-only window (first→last chunk).
+      const hostFullBlock = hostProcBlock(
+        'Host · /proc · full job',
+        hs.cpu_host, hs.ram_host, hs.disk_read_host, hs.disk_write_host
+      );
+      const hostTestsBlock = hostProcBlock(
+        'Host · /proc · tests',
+        hs.cpu_host_tests, hs.ram_host_tests, hs.disk_read_host_tests, hs.disk_write_host_tests
+      );
       grid.innerHTML =
         runLine +
         '<div class="headline-tables">' +
           '<div class="headline-block"><h4>Tests · report</h4>' + testsTable + '</div>' +
-          hostBlock +
+          hostTestsBlock +
+          hostFullBlock +
         '</div>';
       wrap.style.display = 'block';
     }
@@ -2452,6 +2501,11 @@
         // Clone per plot — Plotly mutates traces/layout in place.
         const clone = (obj) => JSON.parse(JSON.stringify(obj));
         Plotly.newPlot(plotId, clone(traces), clone(yaLayout), yaOpts);
+        // Native Plotly unified hover ignores the Timezone selector; use the
+        // same custom tip as other charts so the clock matches axis ticks.
+        el.classList.add('tz-hover');
+        el.on('plotly_hover', showChartTip);
+        el.on('plotly_unhover', hideChartTipSoon);
       }
     })();
 
