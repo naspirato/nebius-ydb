@@ -29,6 +29,8 @@ _EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 @dataclass
 class ConflictInfo:
     file_path: str
+    # Full SHA of the commit whose cherry-pick produced this conflict, if known
+    commit_sha: Optional[str] = None
 
 
 @dataclass
@@ -307,7 +309,17 @@ def is_empty_cherry_pick(output: str) -> bool:
     )
 
 
-def detect_conflicts(repo_path: str, logger) -> List[ConflictInfo]:
+def configure_three_way_conflicts(repo_path: str, logger) -> None:
+    """Use zdiff3 conflict markers so conflicted files keep the common base.
+
+    Default two-way markers only show ours vs theirs; zdiff3 also embeds the
+    shared ancestor, which makes resolving cherry-pick conflicts much easier
+    after they are committed into the backport branch.
+    """
+    run_git(repo_path, ['config', 'merge.conflictStyle', 'zdiff3'], logger)
+
+
+def detect_conflicts(repo_path: str, logger, commit_sha: Optional[str] = None) -> List[ConflictInfo]:
     """Detects conflicts from git status"""
     conflict_files = []
     CONFLICT_STATUS_CODES = ['UU', 'AA', 'DD', 'DU', 'UD', 'AU', 'UA']
@@ -324,7 +336,7 @@ def detect_conflicts(repo_path: str, logger) -> List[ConflictInfo]:
                 if len(parts) > 1:
                     file_path = parts[1].strip()
                     if file_path:
-                        conflict_files.append(ConflictInfo(file_path=file_path))
+                        conflict_files.append(ConflictInfo(file_path=file_path, commit_sha=commit_sha))
     except Exception as e:
         logger.error(f"Error detecting conflicts: {e}")
     
@@ -499,23 +511,52 @@ def build_pr_content(
     conflicts_section = ""
     if has_conflicts:
         branch_for_instructions = dev_branch_name or target_branch
+        # Full backport series so a local redo keeps earlier clean cherry-picks
+        cherry_pick_args = ' '.join(all_commit_shas) if all_commit_shas else '<commit-sha>'
+
         conflicts_section = "\n\n#### Conflicts Require Manual Resolution\n\n"
         conflicts_section += "This PR contains merge conflicts that require manual resolution.\n\n"
+        conflicts_section += (
+            "Conflict markers use **three-way (`zdiff3`)** style so each conflict "
+            "shows the target branch version, the common base, and the incoming change:\n\n"
+            "```text\n"
+            "<<<<<<< HEAD\n"
+            "version on the target branch\n"
+            "||||||| parent of <commit>\n"
+            "shared base (common ancestor)\n"
+            "=======\n"
+            "version from the cherry-picked commit\n"
+            ">>>>>>> <commit>\n"
+            "```\n\n"
+        )
         if conflict_files:
             conflicts_section += "**Files with conflicts:**\n\n"
             for conflict in conflict_files:
                 file_link = f"https://github.com/{repo_name}/pull/{pr_number}/files" if pr_number else f"https://github.com/{repo_name}/blob/{branch_for_instructions}/{conflict.file_path}"
-                conflicts_section += f"- [{conflict.file_path}]({file_link})\n"
+                commit_note = f" (while cherry-picking `{conflict.commit_sha[:7]}`)" if conflict.commit_sha else ""
+                conflicts_section += f"- [{conflict.file_path}]({file_link}){commit_note}\n"
         conflicts_section += f"""
-**How to resolve conflicts:**
+**How to resolve conflicts (edit markers on this branch):**
 
 ```bash
 git fetch origin
 git checkout --track origin/{branch_for_instructions}
-# Resolve conflicts in files
+# Edit conflicted files: keep the right parts, remove all marker lines
 git add .
 git commit -m "Resolved merge conflicts"
 git push
+```
+
+**Optional: resolve with an IDE three-way merge tool**
+
+Re-run the same cherry-pick series locally so git keeps base/ours/theirs stages for the mergetool, then push onto this backport branch:
+
+```bash
+git fetch origin
+git checkout -B tmp-resolve origin/{target_branch}
+git cherry-pick {cherry_pick_args}
+# Resolve in IDE / git mergetool, then:
+git push --force-with-lease origin HEAD:{branch_for_instructions}
 ```
 
 After resolving conflicts:
@@ -634,6 +675,8 @@ def process_branch(
     run_git(repo_path, ['reset', '--hard', 'HEAD'], logger)
     run_git(repo_path, ['checkout', '-B', target_branch, f'origin/{target_branch}'], logger)
     run_git(repo_path, ['checkout', '-b', dev_branch_name, target_branch], logger)
+    # Embed common base in conflict markers for later manual resolution
+    configure_three_way_conflicts(repo_path, logger)
     
     # Cherry-pick each commit
     for commit_sha in commit_shas:
@@ -657,7 +700,7 @@ def process_branch(
                     )
                     continue
                 if "conflict" in output.lower():
-                    conflicts = detect_conflicts(repo_path, logger)
+                    conflicts = detect_conflicts(repo_path, logger, commit_sha=commit_sha)
                     if conflicts:
                         run_git(repo_path, ['add', '-A'], logger)
                         run_git(repo_path, ['commit', '-m', f"BACKPORT-CONFLICT: manual resolution required for commit {commit_sha[:7]}"], logger)
@@ -743,7 +786,8 @@ def process_branch(
         if has_conflicts and all_conflict_files:
             summary += "**Files with conflicts:**\n\n"
             for conflict in all_conflict_files:
-                summary += f"- `{conflict.file_path}`\n"
+                commit_note = f" (commit `{conflict.commit_sha[:7]}`)" if conflict.commit_sha else ""
+                summary += f"- `{conflict.file_path}`{commit_note}\n"
         with open(summary_path, 'a') as f:
             f.write(f'{summary}\n\n')
     

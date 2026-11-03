@@ -2,7 +2,9 @@
 
 import datetime
 import logging
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -12,9 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from github import GithubException
 
 from cherry_pick_v2 import (
+    ConflictInfo,
     Source,
     build_pr_content,
     collect_sources,
+    configure_three_way_conflicts,
     create_commit_source,
     create_pr_source,
     get_merged_commit_shas,
@@ -285,9 +289,72 @@ class BuildPrContentTest(unittest.TestCase):
         sources = [make_source('PR #1: fix', incomplete_note='PR #1 has 3 commits')]
         title, _ = build_pr_content(
             'ydb-platform/ydb', self.make_repo(), 'token', 'stable', 'stable-dev-branch',
-            sources, [mock.Mock(file_path='a.cpp')], [], 'triggerer', None, None, LOGGER,
+            sources, [ConflictInfo(file_path='a.cpp')], [], 'triggerer', None, None, LOGGER,
         )
         self.assertTrue(title.startswith('[INCOMPLETE] [CONFLICT] [Backport stable] '))
+
+    def test_conflict_section_explains_three_way_markers(self):
+        source = make_source('PR #1: fix')
+        source.commit_shas = ['abcdef0123456789']
+        title, body = build_pr_content(
+            'ydb-platform/ydb', self.make_repo(), 'token', 'stable', 'cherry-pick-stable-dev',
+            [source],
+            [ConflictInfo(file_path='a.cpp', commit_sha='abcdef0123456789')],
+            [], 'triggerer', None, 42, LOGGER,
+        )
+        self.assertTrue(title.startswith('[CONFLICT] '))
+        self.assertIn('three-way (`zdiff3`)', body)
+        self.assertIn('shared base (common ancestor)', body)
+        self.assertIn('[a.cpp](https://github.com/ydb-platform/ydb/pull/42/files)', body)
+        self.assertIn('(while cherry-picking `abcdef0`)', body)
+        self.assertIn('git cherry-pick abcdef0123456789', body)
+        self.assertIn('git push --force-with-lease origin HEAD:cherry-pick-stable-dev', body)
+
+
+class ThreeWayConflictStyleTest(unittest.TestCase):
+    """Verifies zdiff3 markers include the common base after a conflicting cherry-pick."""
+
+    def _git(self, repo, *args):
+        return subprocess.run(
+            ['git', *args], cwd=repo, check=True, capture_output=True, text=True,
+        )
+
+    def test_configure_three_way_conflicts_embeds_base_in_markers(self):
+        with tempfile.TemporaryDirectory(prefix='cherry-pick-zdiff3-') as repo:
+            self._git(repo, 'init')
+            self._git(repo, 'config', 'user.name', 'test')
+            self._git(repo, 'config', 'user.email', 'test@example.com')
+            initial = self._git(repo, 'branch', '--show-current').stdout.strip() or 'master'
+
+            path = Path(repo) / 'file.txt'
+            path.write_text('base\n', encoding='utf-8')
+            self._git(repo, 'add', 'file.txt')
+            self._git(repo, 'commit', '-m', 'base')
+
+            self._git(repo, 'checkout', '-b', 'feature')
+            path.write_text('theirs\n', encoding='utf-8')
+            self._git(repo, 'commit', '-am', 'theirs')
+            feature_sha = self._git(repo, 'rev-parse', 'HEAD').stdout.strip()
+
+            self._git(repo, 'checkout', '-b', 'target', initial)
+            path.write_text('ours\n', encoding='utf-8')
+            self._git(repo, 'commit', '-am', 'ours')
+
+            configure_three_way_conflicts(repo, LOGGER)
+            result = subprocess.run(
+                ['git', 'cherry-pick', feature_sha],
+                cwd=repo, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, 'expected a conflict')
+
+            content = path.read_text(encoding='utf-8')
+            self.assertIn('<<<<<<<', content)
+            self.assertIn('|||||||', content)
+            self.assertIn('=======', content)
+            self.assertIn('>>>>>>>', content)
+            self.assertIn('base', content)
+            self.assertIn('ours', content)
+            self.assertIn('theirs', content)
 
 
 class GetMergedCommitShasTest(unittest.TestCase):
