@@ -1,4 +1,4 @@
 line 1
 shared context
-value = old
+value = theirs
 line 4
