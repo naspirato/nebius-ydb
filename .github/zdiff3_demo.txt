@@ -1,4 +1,10 @@
 line 1
 shared context
+<<<<<<< HEAD
 value = ours
+||||||| parent of d12b62c5790 (zdiff3 demo: incoming cherry-pick version (theirs))
+value = old
+=======
+value = theirs
+>>>>>>> d12b62c5790 (zdiff3 demo: incoming cherry-pick version (theirs))
 line 4
