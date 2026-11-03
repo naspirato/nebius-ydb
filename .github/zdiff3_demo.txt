@@ -1,0 +1,4 @@
+line 1
+shared context
+value = old
+line 4
