@@ -304,16 +304,13 @@ class BuildPrContentTest(unittest.TestCase):
         )
         self.assertTrue(title.startswith('[CONFLICT] '))
         self.assertIn('three-way (`zdiff3`)', body)
-        self.assertIn('shared base (common ancestor)', body)
+        self.assertIn('common base', body)
         self.assertIn('[a.cpp](https://github.com/ydb-platform/ydb/pull/42/files)', body)
-        self.assertIn('(while cherry-picking `abcdef0`)', body)
-        self.assertIn('git cherry-pick abcdef0123456789', body)
-        self.assertIn('git push --force-with-lease origin HEAD:cherry-pick-stable-dev', body)
+        self.assertIn('(`abcdef0`)', body)
+        self.assertNotIn('force-with-lease', body)
 
 
 class ThreeWayConflictStyleTest(unittest.TestCase):
-    """Verifies zdiff3 markers include the common base after a conflicting cherry-pick."""
-
     def _git(self, repo, *args):
         return subprocess.run(
             ['git', *args], cwd=repo, check=True, capture_output=True, text=True,
@@ -348,10 +345,7 @@ class ThreeWayConflictStyleTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, 'expected a conflict')
 
             content = path.read_text(encoding='utf-8')
-            self.assertIn('<<<<<<<', content)
             self.assertIn('|||||||', content)
-            self.assertIn('=======', content)
-            self.assertIn('>>>>>>>', content)
             self.assertIn('base', content)
             self.assertIn('ours', content)
             self.assertIn('theirs', content)

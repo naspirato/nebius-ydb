@@ -29,8 +29,7 @@ _EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 @dataclass
 class ConflictInfo:
     file_path: str
-    # Full SHA of the commit whose cherry-pick produced this conflict, if known
-    commit_sha: Optional[str] = None
+    commit_sha: Optional[str] = None  # commit whose cherry-pick conflicted
 
 
 @dataclass
@@ -310,12 +309,7 @@ def is_empty_cherry_pick(output: str) -> bool:
 
 
 def configure_three_way_conflicts(repo_path: str, logger) -> None:
-    """Use zdiff3 conflict markers so conflicted files keep the common base.
-
-    Default two-way markers only show ours vs theirs; zdiff3 also embeds the
-    shared ancestor, which makes resolving cherry-pick conflicts much easier
-    after they are committed into the backport branch.
-    """
+    """Enable zdiff3 markers (ours / base / theirs) for cherry-pick conflicts."""
     run_git(repo_path, ['config', 'merge.conflictStyle', 'zdiff3'], logger)
 
 
@@ -511,21 +505,18 @@ def build_pr_content(
     conflicts_section = ""
     if has_conflicts:
         branch_for_instructions = dev_branch_name or target_branch
-        # Full backport series so a local redo keeps earlier clean cherry-picks
-        cherry_pick_args = ' '.join(all_commit_shas) if all_commit_shas else '<commit-sha>'
-
         conflicts_section = "\n\n#### Conflicts Require Manual Resolution\n\n"
         conflicts_section += "This PR contains merge conflicts that require manual resolution.\n\n"
         conflicts_section += (
-            "Conflict markers use **three-way (`zdiff3`)** style so each conflict "
-            "shows the target branch version, the common base, and the incoming change:\n\n"
+            "Conflict markers are **three-way (`zdiff3`)**: target branch, common base, "
+            "then incoming cherry-pick change.\n\n"
             "```text\n"
             "<<<<<<< HEAD\n"
-            "version on the target branch\n"
+            "target branch\n"
             "||||||| parent of <commit>\n"
-            "shared base (common ancestor)\n"
+            "common base\n"
             "=======\n"
-            "version from the cherry-picked commit\n"
+            "cherry-picked commit\n"
             ">>>>>>> <commit>\n"
             "```\n\n"
         )
@@ -533,30 +524,18 @@ def build_pr_content(
             conflicts_section += "**Files with conflicts:**\n\n"
             for conflict in conflict_files:
                 file_link = f"https://github.com/{repo_name}/pull/{pr_number}/files" if pr_number else f"https://github.com/{repo_name}/blob/{branch_for_instructions}/{conflict.file_path}"
-                commit_note = f" (while cherry-picking `{conflict.commit_sha[:7]}`)" if conflict.commit_sha else ""
+                commit_note = f" (`{conflict.commit_sha[:7]}`)" if conflict.commit_sha else ""
                 conflicts_section += f"- [{conflict.file_path}]({file_link}){commit_note}\n"
         conflicts_section += f"""
-**How to resolve conflicts (edit markers on this branch):**
+**How to resolve conflicts:**
 
 ```bash
 git fetch origin
 git checkout --track origin/{branch_for_instructions}
-# Edit conflicted files: keep the right parts, remove all marker lines
+# Resolve conflicts in files (keep the right parts, remove marker lines)
 git add .
 git commit -m "Resolved merge conflicts"
 git push
-```
-
-**Optional: resolve with an IDE three-way merge tool**
-
-Re-run the same cherry-pick series locally so git keeps base/ours/theirs stages for the mergetool, then push onto this backport branch:
-
-```bash
-git fetch origin
-git checkout -B tmp-resolve origin/{target_branch}
-git cherry-pick {cherry_pick_args}
-# Resolve in IDE / git mergetool, then:
-git push --force-with-lease origin HEAD:{branch_for_instructions}
 ```
 
 After resolving conflicts:
@@ -675,7 +654,6 @@ def process_branch(
     run_git(repo_path, ['reset', '--hard', 'HEAD'], logger)
     run_git(repo_path, ['checkout', '-B', target_branch, f'origin/{target_branch}'], logger)
     run_git(repo_path, ['checkout', '-b', dev_branch_name, target_branch], logger)
-    # Embed common base in conflict markers for later manual resolution
     configure_three_way_conflicts(repo_path, logger)
     
     # Cherry-pick each commit
