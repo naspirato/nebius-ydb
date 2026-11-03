@@ -29,6 +29,7 @@ _EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 @dataclass
 class ConflictInfo:
     file_path: str
+    commit_sha: Optional[str] = None  # commit whose cherry-pick conflicted
 
 
 @dataclass
@@ -307,7 +308,12 @@ def is_empty_cherry_pick(output: str) -> bool:
     )
 
 
-def detect_conflicts(repo_path: str, logger) -> List[ConflictInfo]:
+def configure_three_way_conflicts(repo_path: str, logger) -> None:
+    """Enable zdiff3 markers (ours / base / theirs) for cherry-pick conflicts."""
+    run_git(repo_path, ['config', 'merge.conflictStyle', 'zdiff3'], logger)
+
+
+def detect_conflicts(repo_path: str, logger, commit_sha: Optional[str] = None) -> List[ConflictInfo]:
     """Detects conflicts from git status"""
     conflict_files = []
     CONFLICT_STATUS_CODES = ['UU', 'AA', 'DD', 'DU', 'UD', 'AU', 'UA']
@@ -324,7 +330,7 @@ def detect_conflicts(repo_path: str, logger) -> List[ConflictInfo]:
                 if len(parts) > 1:
                     file_path = parts[1].strip()
                     if file_path:
-                        conflict_files.append(ConflictInfo(file_path=file_path))
+                        conflict_files.append(ConflictInfo(file_path=file_path, commit_sha=commit_sha))
     except Exception as e:
         logger.error(f"Error detecting conflicts: {e}")
     
@@ -501,18 +507,32 @@ def build_pr_content(
         branch_for_instructions = dev_branch_name or target_branch
         conflicts_section = "\n\n#### Conflicts Require Manual Resolution\n\n"
         conflicts_section += "This PR contains merge conflicts that require manual resolution.\n\n"
+        conflicts_section += (
+            "Conflict markers are **three-way (`zdiff3`)**: target branch, common base, "
+            "then incoming cherry-pick change.\n\n"
+            "```text\n"
+            "<<<<<<< HEAD\n"
+            "target branch\n"
+            "||||||| parent of <commit>\n"
+            "common base\n"
+            "=======\n"
+            "cherry-picked commit\n"
+            ">>>>>>> <commit>\n"
+            "```\n\n"
+        )
         if conflict_files:
             conflicts_section += "**Files with conflicts:**\n\n"
             for conflict in conflict_files:
                 file_link = f"https://github.com/{repo_name}/pull/{pr_number}/files" if pr_number else f"https://github.com/{repo_name}/blob/{branch_for_instructions}/{conflict.file_path}"
-                conflicts_section += f"- [{conflict.file_path}]({file_link})\n"
+                commit_note = f" (`{conflict.commit_sha[:7]}`)" if conflict.commit_sha else ""
+                conflicts_section += f"- [{conflict.file_path}]({file_link}){commit_note}\n"
         conflicts_section += f"""
 **How to resolve conflicts:**
 
 ```bash
 git fetch origin
 git checkout --track origin/{branch_for_instructions}
-# Resolve conflicts in files
+# Resolve conflicts in files (keep the right parts, remove marker lines)
 git add .
 git commit -m "Resolved merge conflicts"
 git push
@@ -634,6 +654,7 @@ def process_branch(
     run_git(repo_path, ['reset', '--hard', 'HEAD'], logger)
     run_git(repo_path, ['checkout', '-B', target_branch, f'origin/{target_branch}'], logger)
     run_git(repo_path, ['checkout', '-b', dev_branch_name, target_branch], logger)
+    configure_three_way_conflicts(repo_path, logger)
     
     # Cherry-pick each commit
     for commit_sha in commit_shas:
@@ -657,7 +678,7 @@ def process_branch(
                     )
                     continue
                 if "conflict" in output.lower():
-                    conflicts = detect_conflicts(repo_path, logger)
+                    conflicts = detect_conflicts(repo_path, logger, commit_sha=commit_sha)
                     if conflicts:
                         run_git(repo_path, ['add', '-A'], logger)
                         run_git(repo_path, ['commit', '-m', f"BACKPORT-CONFLICT: manual resolution required for commit {commit_sha[:7]}"], logger)
@@ -743,7 +764,8 @@ def process_branch(
         if has_conflicts and all_conflict_files:
             summary += "**Files with conflicts:**\n\n"
             for conflict in all_conflict_files:
-                summary += f"- `{conflict.file_path}`\n"
+                commit_note = f" (commit `{conflict.commit_sha[:7]}`)" if conflict.commit_sha else ""
+                summary += f"- `{conflict.file_path}`{commit_note}\n"
         with open(summary_path, 'a') as f:
             f.write(f'{summary}\n\n')
     
